@@ -470,6 +470,7 @@ class Client:
         self.id_contracts[req_id] = contract
         self.bracket_parms[req_id] = (profit_offset, loss_offset)
         self.adapter.place_order(req_id, contract, order)
+        return req_id
 
     def cancel_order(self, req_id):
         """Cancel the order associated with the specified request ID.
