@@ -44,3 +44,23 @@ MAX_BLOCK_SIZE = 1800
 
 # Number of seconds to wait between requests to avoid a "pacing violation."
 WAIT_SECONDS = 18
+
+
+# *****************************************************************************
+# COMMISSIONS
+# *****************************************************************************
+
+# Equity commission per share
+EQUITY_PER_SHARE = 0.005
+
+# Equity minimum commission
+EQUITY_MIN = 1.00
+
+# Equity maximum commission as a percentage of trade value
+EQUITY_MAX = 0.005
+
+# Forex commission points (0.2 basis points)
+FX_POINTS = 0.00002
+
+# Forex minimum commission
+FX_MIN = 2.50
