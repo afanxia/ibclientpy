@@ -1,5 +1,5 @@
 """Commission calculations."""
-import ibapipy.config as config
+import ibclientpy.config as config
 
 
 def est_comm(contract, price, quantity):
