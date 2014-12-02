@@ -20,6 +20,8 @@ class Client:
     """Simplified interface to an ibapipy.client_socket.ClientSocket.
 
     Attributes not specified in the constructor:
+    active_reqs   -- set of request keys that are currently active; used to
+                     prevent multiple calls to the same underlying TWS method
     adapter       -- ibclientpy.client_adapter.ClientAdapter object that
                      provides access to the ibapipy ClientSocket
     downloader    -- ibclientpy.historical_downloader.HistoricalDownloader
@@ -37,6 +39,7 @@ class Client:
 
     def __init__(self):
         """Initialize a new instance of a Client."""
+        self.active_reqs = []
         self.adapter = ibca.ClientAdapter(self)
         self.next_id = -1
         self.next_id_lock = threading.Lock()
@@ -127,13 +130,14 @@ class Client:
         direction = 1 if parent.action == 'buy' else -1
         profit_offset, loss_offset = self.bracket_parms.pop(parent.order_id)
         contract = self.id_contracts[parent.order_id]
+        parent_key = str(parent.perm_id)
         # Profit order
         if profit_offset != 0:
             limit_price = parent.avg_fill_price + \
                 abs(profit_offset) * direction
             profit_order = ibo.Order(action, parent.total_quantity, 'lmt',
                                      lmt_price=limit_price)
-            profit_order.oca_group = str(parent.perm_id)
+            profit_order.oca_group = parent_key
             profit_order.oca_type = 2
             profit_order.tif = 'gtc'
             profit_id = self.place_order(contract, profit_order)
@@ -144,13 +148,13 @@ class Client:
             stop_price = parent.avg_fill_price - abs(loss_offset) * direction
             loss_order = ibo.Order(action, parent.total_quantity, 'stp',
                                    aux_price=stop_price)
-            loss_order.oca_group = str(parent.perm_id)
+            loss_order.oca_group = parent_key
             loss_order.oca_type = 2
             loss_order.tif = 'gtc'
             loss_id = self.place_order(contract, loss_order)
         else:
             loss_id = -1
-        self.oca_relations[parent.order_id] = (profit_id, loss_id)
+        self.oca_relations[parent_key] = (profit_id, loss_id)
 
     # *************************************************************************
     # Connection
@@ -211,7 +215,9 @@ class Client:
         """
         key = get_key('account', account_name=account_name)
         self.__add_callback__(key, callback)
-        self.adapter.req_account_updates(True, account_name)
+        if key not in self.active_reqs:
+            self.adapter.req_account_updates(True, account_name)
+            self.active_reqs.add(key)
 
     def cancel_account_updates(self, account_name):
         """Unregister all callbacks from receiving account updates.
@@ -222,7 +228,9 @@ class Client:
         """
         key = get_key('account', account_name=account_name)
         self.__del_all_callbacks__(key)
-        self.adapter.req_account_updates(False, account_name)
+        if key in self.active_reqs:
+            self.adapter.req_account_updates(False, account_name)
+            self.active_reqs.remove(key)
 
     def on_account(self, account):
         """Called by the ClientAdapter when account data is updated. This
@@ -552,7 +560,9 @@ class Client:
         req_id = self.__get_req_id__()
         self.__add_callback__(key, callback, req_id)
         self.id_contracts[req_id] = contract
-        self.adapter.req_mkt_data(req_id, contract)
+        if key not in self.active_reqs:
+            self.adapter.req_mkt_data(req_id, contract)
+            self.active_reqs.add(key)
 
     def cancel_tick_updates(self, contract):
         """Unregister all callbacks from receiving tick updates for the
@@ -565,7 +575,9 @@ class Client:
         key = get_key('tick', contract)
         req_id = self.callback_ids[key]
         self.__del_all_callbacks__(key)
-        self.adapter.cancel_mkt_data(req_id)
+        if key in self.active_reqs:
+            self.adapter.cancel_mkt_data(req_id)
+            self.active_reqs.remove(key)
 
     def on_tick(self, contract, tick):
         """Called by the ClientAdapter when tick data is updated. This
