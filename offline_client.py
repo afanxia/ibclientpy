@@ -4,7 +4,6 @@ locally handled simulated results.
 
 """
 import logging
-import threading
 import ibapipy.data.execution as ibe
 import ibclientpy.client
 import ibclientpy.commissions as comms
@@ -22,18 +21,17 @@ class OfflineClient(ibclientpy.client.Client):
     contract      -- contract associated with the offline ticks
     offline_ticks -- list of ticks used to provide pricing data
     orders        -- dictionary of orders by request ID
-    tick_ready    -- semaphore used to control consumption of a tick
     is_updating   -- True if ticks are being sent; False, otherwise
 
     """
 
-    def __init__(self):
+    def __init__(self, contract):
         """Initialize a new instance of an OfflineClient."""
         ibclientpy.client.Client.__init__(self)
-        self.contract = None
+        self.next_id = 1
+        self.contract = contract
         self.offline_ticks = []
         self.orders = {}
-        self.tick_ready = threading.Semphore()
         self.is_updating = False
 
     # *************************************************************************
@@ -69,21 +67,6 @@ class OfflineClient(ibclientpy.client.Client):
         # Send updates
         for order, execution in need_updated:
             self.on_order(self.contract, order, [execution])
-
-    def __populate__(self):
-        """Call the on_tick() method using the offline ticks list and acquire
-        the tick_ready semaphore. When there are no more ticks to send, None is
-        passed to on_tick() in lieu of a tick object.
-
-        """
-        for tick in self.offline_ticks:
-            if not self.is_updating:
-                return
-            self.on_tick(self.contract, tick)
-            self.tick_ready.acquire()
-        # Send None for the tick to notify the downstream client we are done
-        self.on_tick(self.contract, None)
-        self.tick_ready.acquire()
 
     # *************************************************************************
     # Connection
@@ -254,8 +237,11 @@ class OfflineClient(ibclientpy.client.Client):
         self.__add_callback__(key, callback, req_id)
         self.id_contracts[req_id] = contract
         self.is_updating = True
-        thread = threading.Thread(target=self.__populate__)
-        thread.start()
+        for tick in self.offline_ticks:
+            if not self.is_updating:
+                break
+            self.on_tick(self.contract, tick)
+        self.is_updating = False
 
     def cancel_tick_updates(self, contract):
         """Unregister all callbacks from receiving tick updates for the
@@ -266,9 +252,9 @@ class OfflineClient(ibclientpy.client.Client):
 
         """
         key = ibclientpy.client.get_key('tick', contract)
+        req_id = self.callback_ids[key]
         self.__del_all_callbacks__(key)
         self.is_updating = False
-        self.tick_ready.release()
 
     def on_tick(self, contract, tick):
         """Called by the ClientAdapter when tick data is updated. This
@@ -283,7 +269,6 @@ class OfflineClient(ibclientpy.client.Client):
         if key in self.callbacks:
             for function in self.callbacks[key]:
                 function(contract, tick)
-        self.tick_ready.release()
 
 
 def create_execution(order, milliseconds):
@@ -363,8 +348,8 @@ def fill_order(order, contract, price, milliseconds, oca_relations):
     # Try to find the other order in the OCA group
     oca_id = -1
     if order.oca_group != '' and order.oca_group in oca_relations:
-        parent_id = order.oca_group
-        profit_id, loss_id = oca_relations[parent_id]
+        parent_key = order.oca_group
+        profit_id, loss_id = oca_relations[parent_key]
         if order.order_id == profit_id:
             oca_id = loss_id
         else:
