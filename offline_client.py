@@ -252,7 +252,6 @@ class OfflineClient(ibclientpy.client.Client):
 
         """
         key = ibclientpy.client.get_key('tick', contract)
-        req_id = self.callback_ids[key]
         self.__del_all_callbacks__(key)
         self.is_updating = False
 
