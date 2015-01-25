@@ -12,7 +12,7 @@ import calendar
 import pytz
 import time
 import ibapipy.client_socket as ibcs
-import ibapipy.date_support as ds
+import ibclientpy.date_support as ds
 
 
 class ClientAdapter(ibcs.ClientSocket):
