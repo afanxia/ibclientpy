@@ -3,6 +3,8 @@ the ibclientpy.client.Client class. Calls to the broker are replaced with
 locally handled simulated results.
 
 """
+from asyncio import Future
+import asyncio
 import logging
 import ibapipy.data.execution as ibe
 import ibclientpy.client
@@ -19,7 +21,7 @@ class OfflineClient(ibclientpy.client.Client):
 
     Attributes not specified in the constructor:
     contract      -- contract associated with the offline ticks
-    offline_ticks -- list of ticks used to provide pricing data
+    offline_ticks -- queue of ticks used to provide pricing data
     orders        -- dictionary of orders by request ID
     is_updating   -- True if ticks are being sent; False, otherwise
 
@@ -30,7 +32,7 @@ class OfflineClient(ibclientpy.client.Client):
         ibclientpy.client.Client.__init__(self)
         self.next_id = 1
         self.contract = contract
-        self.offline_ticks = []
+        self.offline_ticks = asyncio.Queue()
         self.orders = {}
         self.is_updating = False
 
@@ -72,6 +74,7 @@ class OfflineClient(ibclientpy.client.Client):
     # Connection
     # *************************************************************************
 
+    @asyncio.coroutine
     def connect(self, host=config.HOST, port=config.PORT,
                 client_id=config.CLIENT_ID):
         """Connect to the remote TWS.
@@ -84,10 +87,12 @@ class OfflineClient(ibclientpy.client.Client):
         """
         pass
 
+    @asyncio.coroutine
     def disconnect(self):
         """Disconnect from the remote TWS."""
         pass
 
+    @asyncio.coroutine
     def is_connected(self):
         """Return True if the Client is connected; False, otherwise."""
         return False
@@ -96,22 +101,20 @@ class OfflineClient(ibclientpy.client.Client):
     # Accounts
     # *************************************************************************
 
-    def req_account_updates(self, account_name, callback):
-        """Register the specified callback to receive account updates. The
-        callback should have the same signature as 'on_account'.
-
-        Keyword arguments:
-        account_name -- account name
-        callback     -- function to call on account updates
+    @asyncio.coroutine
+    def get_account_name(self):
+        """Return the account name associated with this session as a string.
 
         """
         pass
 
-    def cancel_account_updates(self, account_name):
-        """Unregister all callbacks from receiving account updates.
+    @asyncio.coroutine
+    def get_account(self, account_name):
+        """Return the ibapipy.data.account.Account instance associated with the
+        specified account name.
 
         Keyword arguments:
-        account_name -- account name
+        account_name -- account name as a string
 
         """
         pass
@@ -120,12 +123,15 @@ class OfflineClient(ibclientpy.client.Client):
     # Contracts
     # *************************************************************************
 
-    def req_contract(self, contract, callback):
-        """Register the specified callback to receive a one-time update for the
-        contract. The callback should have the same signature as 'on_contract'.
+    @asyncio.coroutine
+    def get_contract(self, contract):
+        """Return a fully populated ibapipy.data.contract.Contract instance
+        from the specified "basic" Contract. The specified contract should
+        be populated with the 'sec_type', 'symbol', 'currency', and 'exchange'
+        attributes.
 
         Keyword arguments:
-        callback -- function to call on contract updates
+        contract -- basic ibapipy.data.contract.Contract
 
         """
         pass
@@ -134,18 +140,18 @@ class OfflineClient(ibclientpy.client.Client):
     # Orders
     # *************************************************************************
 
-    def req_order_updates(self, callback):
-        """Register the specified callback to receive order and execution
-        updates. The callback should have the same signature as 'on_order'.
-
-        Keyword arguments:
-        callback -- function to call on order and execution updates
+    @asyncio.coroutine
+    def get_orders(self):
+        """Return a tuple of ibapipy.data.order.Order instances with additional
+        attributes on each order. Each order has a 'contract' field and
+        'executions' field added to it where the contract is the underlying
+        contract being traded and 'executions' is a list of executions
+        associated with the order.
 
         """
-        key = ibclientpy.client.get_key('order')
-        req_id = self.__get_req_id__()
-        self.__add_callback__(key, callback, req_id)
+        return tuple(self.orders.values())
 
+    @asyncio.coroutine
     def place_order(self, contract, order, profit_offset=0, loss_offset=0):
         """Place an order for the specified contract. If profit offset or loss
         offset is non-zero, a corresponding order will be placed after the
@@ -169,7 +175,8 @@ class OfflineClient(ibclientpy.client.Client):
         if order.order_id in self.orders:
             req_id = order.order_id
         else:
-            req_id = self.__get_req_id__()
+            req_id = self.next_id
+            self.next_id += 1
             self.id_contracts[req_id] = contract
             order.order_id = req_id
             order.perm_id = req_id
@@ -177,6 +184,7 @@ class OfflineClient(ibclientpy.client.Client):
         self.orders[req_id] = order
         return req_id
 
+    @asyncio.coroutine
     def cancel_order(self, req_id):
         """Cancel the order associated with the specified request ID.
 
@@ -187,87 +195,54 @@ class OfflineClient(ibclientpy.client.Client):
         if req_id in self.orders:
             order = self.orders.pop(req_id)
             order.status = 'cancelled'
-            self.on_order(self.contract, order, [])
 
     # *************************************************************************
     # Pricing
     # *************************************************************************
 
-    def req_history(self, contract, start, end, timezone, callback):
-        """Register the specified callback to receive a one-time update for
-        historical data. The callback should have the same signature as
-        'on_history'.
+    @asyncio.coroutine
+    def get_history(self, contract, start, end, timezone):
+        """Return a generator containing tuples of the form (int, list) where
+        'int' is the number of historical ticks remaining the the request and
+        'list' is a list of historical ticks being returned as part of the
+        intermediate result.
+
+        There will be intermittent delays in the generated data as needed to
+        prevent IB pacing violations.
 
         Keyword arguments:
         contract   -- ibapipy.data.contract.Contract object
         start_date -- start date in 'yyyy-mm-dd hh:mm' format
         end_date   -- end date in 'yyyy-mm-dd hh:mm' format
         timezone   -- timezone in 'Country/Region' format
-        callback   -- function to call on historical data updates
 
         """
         pass
 
-    def on_history(self, contract, tick, is_block_done, is_request_done):
-        """Called by the ClientAdapter when historical data is updated. This
-        encapsulates the following methods from the TWS API:
-            - historical_data
-
-        Keyword arguments:
-        contract        -- ibapipy.data.contract.Contract object
-        tick            -- ibapipy.data.tick.Tick object
-        is_block_done   -- True if the current block of ticks is done
-        is_request_done -- True if there is no more data available for the
-                           original call to 'req_history'
-
-        """
-        pass
-
-    def req_tick_updates(self, contract, callback):
-        """Register the specified callback to receive tick updates. The
-        callback should have the same signature as 'on_tick'.
+    @asyncio.coroutine
+    def get_ticks(self, contract):
+        """Return a generator containing realtime ticks. Ticks will be yielded
+        until cancel_ticks() is called.
 
         Keyword arguments:
         contract -- ibapipy.data.contract.Contract object
-        callback -- function to call on holding updates
 
         """
-        key = ibclientpy.client.get_key('tick', contract)
-        req_id = self.__get_req_id__()
-        self.__add_callback__(key, callback, req_id)
+        req_id = self.next_id
+        self.next_id += 1
         self.id_contracts[req_id] = contract
-        self.is_updating = True
-        for tick in self.offline_ticks:
-            if not self.is_updating:
-                break
-            self.on_tick(self.contract, tick)
-        self.is_updating = False
-
-    def cancel_tick_updates(self, contract):
-        """Unregister all callbacks from receiving tick updates for the
-        specified contract.
-
-        Keyword arguments:
-        contract -- ibapipy.data.contract.Contract object
-
-        """
-        key = ibclientpy.client.get_key('tick', contract)
-        self.__del_all_callbacks__(key)
-        self.is_updating = False
-
-    def on_tick(self, contract, tick):
-        """Called by the ClientAdapter when tick data is updated. This
-        encapsulates the following methods from the TWS API:
-            - tick_size
-            - tick_price
-
-        """
-        if tick is not None:
+        while self.is_updating and not self.offline_ticks.empty():
+            tick = yield from self.offline_ticks.get()
             self.__handle_orders__(tick)
-        key = ibclientpy.client.get_key('tick', contract)
-        if key in self.callbacks:
-            for function in self.callbacks[key]:
-                function(contract, tick)
+            fut = Future()
+            fut.set_result(tick)
+            yield from fut
+        self.is_updating = False
+
+    @asyncio.coroutine
+    def cancel_ticks(self):
+        """Stop receiving ticks from the get_ticks() method."""
+        self.is_updating = False
 
 
 def create_execution(order, milliseconds):
