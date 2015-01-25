@@ -33,12 +33,10 @@ class ClientTests(unittest.TestCase):
         self.loop.close()
 
     def test_constructor(self):
-        return
         client = Client()
         self.assertFalse(client.is_connected())
 
     def test_connect(self):
-        return
         client = Client(self.loop)
         self.assertFalse(client.is_connected())
         self.loop.run_until_complete(client.connect())
@@ -48,7 +46,6 @@ class ClientTests(unittest.TestCase):
         self.assertFalse(client.is_connected())
 
     def test_get_account_name(self):
-        return
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         task = Task(client.get_account_name())
@@ -59,7 +56,6 @@ class ClientTests(unittest.TestCase):
         self.assertTrue(len(account_name) > 0)
 
     def test_get_account(self):
-        return
         # This can be a time-consuming test (sometimes IB takes a minute or so
         # to return all of the account data)
         client = Client(self.loop)
@@ -75,7 +71,6 @@ class ClientTests(unittest.TestCase):
         self.loop.run_until_complete(client.disconnect())
 
     def test_get_contract(self):
-        return
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         task = Task(client.get_contract(TEST_CONTRACT))
@@ -84,7 +79,6 @@ class ClientTests(unittest.TestCase):
         self.loop.run_until_complete(client.disconnect())
 
     def test_get_orders(self):
-        return
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         # Place two test orders
@@ -110,7 +104,6 @@ class ClientTests(unittest.TestCase):
         self.loop.run_until_complete(client.disconnect())
 
     def test_get_history(self):
-        return
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         historical_ticks = []
