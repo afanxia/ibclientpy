@@ -16,7 +16,7 @@ from ibclientpy.client import Client
 
 
 # Enable debug mode for asyncio
-#logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG)
 
 # Contract to use for testing
 TEST_CONTRACT = ibc.Contract('cash', 'eur', 'usd', 'idealpro')
@@ -45,6 +45,16 @@ class ClientTests(unittest.TestCase):
         self.loop.run_until_complete(client.disconnect())
         self.assertFalse(client.is_connected())
 
+    def test_get_next_valid_id(self):
+        client = Client(self.loop)
+        self.loop.run_until_complete(client.connect())
+        self.assertTrue(client.is_connected())
+        self.assertTrue(client.next_id > 0)
+        orig_id = client.next_id
+        next_id = self.loop.run_until_complete(client.get_next_valid_id())
+        self.assertEqual(orig_id, next_id)
+        self.loop.run_until_complete(client.disconnect())
+
     def test_get_account_name(self):
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
@@ -60,12 +70,7 @@ class ClientTests(unittest.TestCase):
         # to return all of the account data)
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
-        # We need the account name first
-        task = Task(client.get_account_name())
-        self.loop.run_until_complete(task)
-        account_name = task.result()
-        # Now get the full account
-        task = Task(client.get_account(account_name))
+        task = Task(client.get_account())
         self.loop.run_until_complete(task)
         self.assertIsNotNone(task.result())
         self.loop.run_until_complete(client.disconnect())
@@ -82,24 +87,27 @@ class ClientTests(unittest.TestCase):
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         # Place two test orders
-        test_order = ibo.Order('buy', 110000, 'stp', aux_price=2)
-        task = Task(client.place_order(TEST_CONTRACT, test_order))
+        buy_order = ibo.Order('buy', 110000, 'stp', aux_price=2)
+        task = Task(client.place_order(TEST_CONTRACT, buy_order))
         self.loop.run_until_complete(task)
-        order_id1 = task.result()
-        self.assertTrue(order_id1 > 0)
-        task = Task(client.place_order(TEST_CONTRACT, test_order))
+        buy_order_id = task.result()
+        self.assertTrue(buy_order_id > 0)
+        sell_order = ibo.Order('sell', 110000, 'stp', aux_price=0.2)
+        task = Task(client.place_order(TEST_CONTRACT, sell_order))
         self.loop.run_until_complete(task)
-        order_id2 = task.result()
-        self.assertTrue(order_id2 > 0)
-        # Retrieve the open orders
+        sell_order_id = task.result()
+        self.assertTrue(sell_order_id > 0)
+        # Retrieve the open orders matching our test ids
         task = Task(client.get_orders())
         self.loop.run_until_complete(task)
         self.assertIsNotNone(task.result())
-        self.assertEqual(2, len(task.result()))
+        orders = [x for x in task.result()
+                  if x.order_id in (buy_order_id, sell_order_id)]
+        self.assertEqual(2, len(orders))
         # Cancel the orders and disconnect
-        task = Task(client.cancel_order(order_id1))
+        task = Task(client.cancel_order(buy_order_id))
         self.loop.run_until_complete(task)
-        task = Task(client.cancel_order(order_id2))
+        task = Task(client.cancel_order(sell_order_id))
         self.loop.run_until_complete(task)
         self.loop.run_until_complete(client.disconnect())
 
@@ -107,13 +115,18 @@ class ClientTests(unittest.TestCase):
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         historical_ticks = []
+        result_queue = asyncio.Queue()
         @asyncio.coroutine
         def get_history():
-            history = client.get_history(TEST_CONTRACT, '2015-01-15 10:00',
-                                         '2015-01-15 11:00', 'US/Eastern')
-            for item in history:
-                remaining, ticks = yield from item
-                historical_ticks.extend(ticks)
+            yield from client.get_history(result_queue, TEST_CONTRACT,
+                                          '2015-01-15 10:00',
+                                          '2015-01-15 11:00', 'US/Eastern')
+            while True:
+                item = yield from result_queue.get()
+                if item is None:
+                    break
+                remaining, tick = item
+                historical_ticks.append(tick)
         self.loop.run_until_complete(get_history())
         self.loop.run_until_complete(client.disconnect())
         self.assertEqual(3600, len(historical_ticks))
@@ -122,20 +135,35 @@ class ClientTests(unittest.TestCase):
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         realtime_ticks = []
+        result_queue = asyncio.Queue()
         @asyncio.coroutine
         def get_ticks():
             tick_count = 0
-            ticks = client.get_ticks(TEST_CONTRACT)
-            for item in ticks:
-                tick = yield from item
+            yield from client.get_ticks(result_queue, TEST_CONTRACT)
+            while True:
+                tick = yield from result_queue.get()
+                if tick is None:
+                    break
                 realtime_ticks.append(tick)
-                tick_count += 1
-                if tick_count == 5:
+                if len(realtime_ticks) == 3:
                     yield from client.cancel_ticks()
         self.loop.run_until_complete(get_ticks())
         self.loop.run_until_complete(client.disconnect())
-        self.assertEqual(5, len(realtime_ticks))
+        self.assertTrue(len(realtime_ticks) >= 3)
 
 
 if __name__ == '__main__':
-    unittest.main()
+    all_tests = unittest.TestSuite()
+    all_tests.addTest(ClientTests('test_constructor'))
+    all_tests.addTest(ClientTests('test_connect'))
+    all_tests.addTest(ClientTests('test_get_next_valid_id'))
+    all_tests.addTest(ClientTests('test_get_account_name'))
+    all_tests.addTest(ClientTests('test_get_account'))
+    all_tests.addTest(ClientTests('test_get_contract'))
+    all_tests.addTest(ClientTests('test_get_orders'))
+    all_tests.addTest(ClientTests('test_get_history'))
+    single_test = unittest.TestSuite()
+    single_test.addTest(ClientTests('test_get_ticks'))
+    #unittest.TextTestRunner(verbosity=2).run(all_tests)
+    unittest.TextTestRunner(verbosity=2).run(single_test)
+

@@ -43,7 +43,7 @@ FORMAT_DATE = 2
 MAX_BLOCK_SIZE = 1800
 
 # Number of seconds to wait between requests to avoid a "pacing violation."
-WAIT_SECONDS = 18
+WAIT_SECONDS = 20
 
 
 # *****************************************************************************

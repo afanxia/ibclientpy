@@ -2,7 +2,7 @@
 ibclientpy.client.Client.
 
 """
-from asyncio import Future
+from asyncio import Future, Queue
 from ibapipy.data.account import Account
 from ibapipy.data.holding import Holding
 from ibapipy.data.order import Order
@@ -22,78 +22,105 @@ class ClientAdapter(ibcs.ClientSocket):
         """Initialize a new instance of a ClientAdapter."""
         ibcs.ClientSocket.__init__(self, loop)
         self.client = client
-        # Current account and tick (by symbol.currency)
+        # Connection
+        self.next_valid_id_fut = None
+        # Accounts
+        # Account information is updated one attribute at a time via multiple
+        # calls so we maintain a single instance here (account) that is
+        # always updated.
         self.account = Account()
-        self.tick = {}
-        # Contracts, orders, and executions by perm_id
-        self.execs_by_id = {}
-        self.orders_by_id = {}
-        self.order_contracts = {}
-        self.order_orders = {}
-        self.order_executions = {}
-        # When requesting orders via req_all_open_orders(),
-        # the open_orders_end() method will be called after order_status() has
-        # been called for each order, but before open_order() has been called
-        # for each order. It doesn't seem like it should work that way, but...
-        # So, instead of relying on open_orders_end(), we keep track of what
-        # orders order_status() has been called for and use that so
-        # open_order() knows when to return a result. This dictionary contains
-        # the req_ids that have been seen by order_status() -- the value is set
-        # from False to True once open_order() has seen it.
+        self.account_fut = Future()
+        self.account_name_fut = Future()
+        # Contracts
+        # Contract asyncio.Futures by 'symbol.currency' key
+        self.contract_futs = {}
+        # Order call tracking -- see order_status() comments for details
+        self.open_order_end_called = False
         self.open_order_ids = {}
         # Historical ticks
-        self.historical_remaining = 0
-        self.historical_ticks = []
+        self.history_ready = Future()
+        self.history_remaining = 0
+        self.history_queue = Queue()
         # Realtime ticks
+        self.tick = {}
         self.is_receiving_ticks = False
+        self.realtime_queue = Queue()
         # Futures
-        self.contract_fut = None
         self.executions_fut = None
-        self.history_fut = None
-        self.next_valid_id_fut = None
-        self.managed_accounts_fut = None
         self.orders_fut = None
         self.order_cancel_fut = None
-        self.ticks_fut = None
-        self.update_account_fut = None
 
     # *************************************************************************
     # Outgoing Requests
     # *************************************************************************
 
     @asyncio.coroutine
+    def req_account_updates(self, acct_code):
+        self.account_fut = Future()
+        self.account.account_name = None
+        self.account.milliseconds = 0
+        self.account.net_liquidation = None
+        self.account.previous_equity = None
+        self.account.equity = None
+        self.account.cash = None
+        self.account.initial_margin = None
+        self.account.maintenance_margin = None
+        self.account.available_funds = None
+        self.account.excess_liquidity = None
+        self.account.sma = None
+        self.account.buying_power = None
+        yield from ibcs.ClientSocket.req_account_updates(self, True,
+                                                         acct_code)
+        return self.account_fut
+
+    @asyncio.coroutine
     def req_all_open_orders(self):
+        self.open_order_end_called = False
         self.open_order_ids.clear()
-        self.orders_by_id.clear()
         yield from ibcs.ClientSocket.req_all_open_orders(self)
 
     @asyncio.coroutine
+    def req_contract_details(self, req_id, contract):
+        key = '{0}.{1}'.format(contract.symbol, contract.currency)
+        self.contract_futs[key] = Future()
+        yield from ibcs.ClientSocket.req_contract_details(self, req_id,
+                                                          contract)
+        return self.contract_futs[key]
+
+    @asyncio.coroutine
     def req_executions(self, req_id, exec_filter):
-        self.execs_by_id.clear()
         yield from ibcs.ClientSocket.req_executions(self, req_id, exec_filter)
 
     @asyncio.coroutine
-    def req_historical_data(self, req_id, contract, end_date_time,
+    def req_historical_data(self, results, req_id, contract, end_date_time,
                             duration_str, bar_size_setting, what_to_show,
                             use_rth, format_date):
-        self.history_fut = Future()
-        self.historical_ticks.clear()
+        self.history_ready = Future()
+        self.history_queue = results
         yield from ibcs.ClientSocket.req_historical_data(
             self, req_id, contract, end_date_time, duration_str,
             bar_size_setting, what_to_show, use_rth, format_date)
-        yield from self.history_fut
+        yield from self.history_ready
 
     @asyncio.coroutine
-    def req_mkt_data(self, req_id, contract, generic_ticklist='',
+    def req_ids(self, num_ids):
+        self.next_valid_id_fut = Future()
+        yield from ibcs.ClientSocket.req_ids(self, num_ids)
+        return self.next_valid_id_fut
+
+    @asyncio.coroutine
+    def req_managed_accts(self):
+        self.account_name_fut = Future()
+        yield from ibcs.ClientSocket.req_managed_accts(self)
+        return self.account_name_fut
+
+    @asyncio.coroutine
+    def req_mkt_data(self, results, req_id, contract, generic_ticklist='',
                      snapshot=False):
         self.is_receiving_ticks = True
-        self.ticks_fut = Future()
+        self.realtime_queue = results
         yield from ibcs.ClientSocket.req_mkt_data(self, req_id, contract,
                                                   generic_ticklist, snapshot)
-        while self.is_receiving_ticks:
-            yield from self.ticks_fut
-            self.ticks_fut = Future()
-        yield from ibcs.ClientSocket.cancel_mkt_data(self, req_id)
 
     # *************************************************************************
     # Incoming Data
@@ -101,15 +128,13 @@ class ClientAdapter(ibcs.ClientSocket):
 
     @asyncio.coroutine
     def account_download_end(self, account_name):
-        fut = self.update_account_fut
-        if fut is not None and not fut.done():
-            fut.set_result(self.account)
+        pass
 
     @asyncio.coroutine
     def contract_details(self, req_id, contract):
-        fut = self.contract_fut
-        if fut is not None and not fut.done():
-            fut.set_result(contract)
+        key = '{0}.{1}'.format(contract.symbol, contract.currency)
+        if is_future_valid(self.contract_futs[key]):
+            self.contract_futs[key].set_result(contract)
 
     @asyncio.coroutine
     def contract_details_end(self, req_id):
@@ -121,10 +146,7 @@ class ClientAdapter(ibcs.ClientSocket):
 
     @asyncio.coroutine
     def exec_details(self, req_id, contract, execution):
-        perm_id = execution.perm_id
-        if perm_id not in self.execs_by_id:
-            self.execs_by_id[perm_id] = []
-        self.execs_by_id[perm_id].append(execution)
+        self.client.order_handler.add_execution(execution)
 
     @asyncio.coroutine
     def exec_details_end(self, req_id):
@@ -135,16 +157,10 @@ class ClientAdapter(ibcs.ClientSocket):
     @asyncio.coroutine
     def historical_data(self, req_id, date, open, high, low, close, volume,
                         bar_count, wap, has_gaps):
-        if req_id in self.client.id_contracts:
-            contract = self.client.id_contracts[req_id]
-        else:
-            contract = None
+        contract = self.client.id_contracts[req_id]
         # Download is complete
-        if 'finished' in date:
-            fut = self.history_fut
-            if fut is not None and not fut.done():
-                fut.set_result((self.historical_remaining,
-                                self.historical_ticks))
+        if 'finished' in date and is_future_valid(self.history_ready):
+            self.history_ready.set_result(True)
         # Still receiving bars from the request
         else:
             milliseconds = int(date) * 1000
@@ -152,14 +168,13 @@ class ClientAdapter(ibcs.ClientSocket):
             tick.bid = low
             tick.ask = high
             tick.volume = volume * 100
-            self.historical_remaining -= 1
-            self.historical_ticks.append(tick)
+            self.history_remaining -= 1
+            yield from self.history_queue.put((self.history_remaining, tick))
 
     @asyncio.coroutine
     def managed_accounts(self, account_number):
-        fut = self.managed_accounts_fut
-        if fut is not None and not fut.done():
-            fut.set_result(account_number)
+        if is_future_valid(self.account_name_fut):
+            self.account_name_fut.set_result(account_number)
 
     @asyncio.coroutine
     def next_valid_id(self, req_id):
@@ -169,40 +184,43 @@ class ClientAdapter(ibcs.ClientSocket):
 
     @asyncio.coroutine
     def open_order(self, req_id, contract, order):
-        perm_id = order.perm_id
-        order.contract = contract
-        order.executions = []
-        if perm_id in self.execs_by_id:
-            order.executions.extend(self.execs_by_id[perm_id])
-        self.orders_by_id[perm_id] = order
-        # Update our "open order tracking" dictionary
-        if req_id in self.open_order_ids:
-            self.open_order_ids[req_id] = True
-        # See if we should return a result
-        fut = self.orders_fut
-        if False not in self.open_order_ids.values() and \
-                fut is not None and not fut.done():
-            result = []
-            for perm_id in self.orders_by_id:
-                result.append(self.orders_by_id[perm_id])
-            fut.set_result(tuple(result))
+        self.client.order_handler.update_order(req_id, contract, order)
+        # Update our "open order tracking" dictionary. Being in the dictionary
+        # means that open_order has been called or order_status has been called
+        # with a status of 'apipending'; having a value of False means that
+        # order_status has yet to be called with a non-apipending status. See
+        # the order_status() comments for details.
+        if req_id not in self.open_order_ids:
+            self.open_order_ids[req_id] = False
 
     @asyncio.coroutine
     def open_order_end(self):
-        pass
+        self.open_order_end_called = True
 
     @asyncio.coroutine
     def order_status(self, req_id, status, filled, remaining, avg_fill_price,
                      perm_id, parent_id, last_fill_price, client_id, why_held):
-        # Keep track of what orders this has been called for. We wait until we
-        # get 'apipending' so that we can't do something like cancel an order
-        # before it's even been fulled entered (otherwise we can end up with
-        # an order that just stays in 'pendingcancel' forever).
-        if req_id not in self.open_order_ids and status == 'apipending':
-            self.open_order_ids[req_id] = False
-        if perm_id not in self.order_orders:
-            self.order_orders[perm_id] = Order()
-        order = self.order_orders[perm_id]
+        """Called when the order status is updated.
+
+        The IB API appears to work like this:
+        - open_order is called for orders that are not apipending
+        - order_status is called for all orders
+        - open_order_end is called
+        - open_order is called for orders that have moved from apipending
+        - order_status is called for orders that have moved from apipending
+
+        Since open_order_end does not mark the end of the request process, we
+        must use order_status to determine when we have all of the order
+        information. This method is always called after open_order for a given
+        request id.
+
+        """
+        # Track which order order_status has been called on
+        self.open_order_ids[req_id] = status != 'apipending'
+        if req_id not in self.client.order_handler.orders:
+            return
+        order = self.client.order_handler.orders[req_id]
+        order.order_id = req_id
         order.status = status
         order.filled = filled
         order.remaining = remaining
@@ -216,6 +234,11 @@ class ClientAdapter(ibcs.ClientSocket):
         fut = self.order_cancel_fut
         if status == 'cancelled' and fut is not None and not fut.done():
             fut.set_result(req_id)
+        # See if we should return a result on the orders future
+        fut = self.orders_fut
+        if False not in self.open_order_ids.values() and fut is not None and \
+                self.open_order_end_called and not fut.done():
+            fut.set_result(tuple(self.client.order_handler.orders.values()))
 
     @asyncio.coroutine
     def tick_price(self, req_id, tick_type, price, can_auto_execute):
@@ -232,9 +255,8 @@ class ClientAdapter(ibcs.ClientSocket):
             tick.milliseconds = ds.now()
             tick.ask = price
         # We can get ask prices lower than bid prices; don't return those.
-        if tick.bid > 0 and tick.ask > tick.bid and \
-                self.ticks_fut is not None and not self.ticks_fut.done():
-            self.ticks_fut.set_result(copy_tick(tick))
+        if tick.bid > 0 and tick.ask > tick.bid:
+            yield from self.realtime_queue.put(copy_tick(tick))
 
     @asyncio.coroutine
     def tick_size(self, req_id, tick_type, size):
@@ -268,11 +290,12 @@ class ClientAdapter(ibcs.ClientSocket):
         partial_date = ms_to_str(time.time() * 1000, 'UTC', '%Y-%m-%d')
         full_date = '{0} {1}'.format(partial_date, timestamp)
         self.account.milliseconds = str_to_ms(full_date, 'UTC',
-                                              '%Y-%m-%d %H:%M')
+                                                      '%Y-%m-%d %H:%M')
 
     @asyncio.coroutine
     def update_account_value(self, key, value, currency, account_name):
         self.account.account_name = account_name
+        self.account.milliseconds = int(time.time() * 1000)
         if key == 'netliquidation':
             self.account.net_liquidation = float(value)
         elif key == 'previousdayequitywithloanvalue':
@@ -293,6 +316,25 @@ class ClientAdapter(ibcs.ClientSocket):
             self.account.sma = float(value)
         elif key == 'buyingpower':
             self.account.buying_power = float(value)
+        # It can take IB a long time to call account_download_end, so we check
+        # to see if we have all the data we need and, if so, consider the
+        # request completed.
+        if self.account.account_name is not None and \
+                self.account.milliseconds > 0 and \
+                self.account.net_liquidation is not None and \
+                self.account.previous_equity is not None and \
+                self.account.equity is not None and \
+                self.account.cash is not None and \
+                self.account.initial_margin is not None and \
+                self.account.maintenance_margin is not None and \
+                self.account.available_funds is not None and \
+                self.account.excess_liquidity is not None and \
+                self.account.sma is not None and \
+                self.account.buying_power is not None and \
+                is_future_valid(self.account_fut):
+            yield from ibcs.ClientSocket.req_account_updates(self, False,
+                                                             account_name)
+            self.account_fut.set_result(self.account)
 
     @asyncio.coroutine
     def update_portfolio(self, contract, position, market_price, market_value,
@@ -333,6 +375,17 @@ def copy_tick(tick):
     result = Tick(tick.local_symbol, tick.milliseconds)
     result.__dict__.update(tick.__dict__)
     return result
+
+
+def is_future_valid(future):
+    """Return True if the specified future is not None and is not done; False,
+    otherwise.
+
+    Keyword arguments:
+    future -- asyncio.Future instance
+
+    """
+    return future is not None and not future.done()
 
 
 def ms_to_str(milliseconds, timezone='UTC', formatting='%Y-%m-%d %H:%M:%S.%f'):

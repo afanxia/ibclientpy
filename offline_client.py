@@ -56,19 +56,10 @@ class OfflineClient(ibclientpy.client.Client):
                 need_filled.append((order, price))
         # Fill orders
         for order, price in need_filled:
-            execution, cancel_id = fill_order(order, self.contract,
-                                              price, tick.milliseconds,
-                                              self.oca_relations)
-            if cancel_id >= 0:
-                need_cancelled.append(cancel_id)
-            need_updated.append((order, execution))
-            self.orders.pop(order.order_id)
-        # Cancel orders
-        for order_id in need_cancelled:
-            self.cancel_order(order_id)
-        # Send updates
-        for order, execution in need_updated:
-            self.on_order(self.contract, order, [execution])
+            cancel_id = fill_order(order, self.contract, price,
+                                   tick.milliseconds, self.oca_relations)
+            if cancel_id >= 0 and cancel_id in self.orders:
+                self.orders[cancel_id].status = 'cancelled'
 
     # *************************************************************************
     # Connection
@@ -181,6 +172,8 @@ class OfflineClient(ibclientpy.client.Client):
             order.order_id = req_id
             order.perm_id = req_id
         self.bracket_parms[req_id] = (profit_offset, loss_offset)
+        order.contract = contract
+        order.executions = []
         self.orders[req_id] = order
         return req_id
 
@@ -193,7 +186,7 @@ class OfflineClient(ibclientpy.client.Client):
 
         """
         if req_id in self.orders:
-            order = self.orders.pop(req_id)
+            order = self.orders[req_id]
             order.status = 'cancelled'
 
     # *************************************************************************
@@ -220,9 +213,10 @@ class OfflineClient(ibclientpy.client.Client):
         pass
 
     @asyncio.coroutine
-    def get_ticks(self, contract):
-        """Return a generator containing realtime ticks. Ticks will be yielded
-        until cancel_ticks() is called.
+    def get_ticks(self, results, contract):
+        """Populate the specified results queue with realtime ticks. Ticks will
+        be put into the queue until cancel_ticks() is called at which point
+        None will be put in the queue to signify the end of data.
 
         Keyword arguments:
         contract -- ibapipy.data.contract.Contract object
@@ -231,12 +225,11 @@ class OfflineClient(ibclientpy.client.Client):
         req_id = self.next_id
         self.next_id += 1
         self.id_contracts[req_id] = contract
+        self.is_updating = True
         while self.is_updating and not self.offline_ticks.empty():
             tick = yield from self.offline_ticks.get()
-            self.__handle_orders__(tick)
-            fut = Future()
-            fut.set_result(tick)
-            yield from fut
+            yield from results.put(tick)
+        yield from results.put(None)
         self.is_updating = False
 
     @asyncio.coroutine
@@ -278,6 +271,8 @@ def check_order(order, tick):
     tick  -- ibapipy.data.tick.Tick representing the current price
 
     """
+    if order.status == 'filled' or order.status == 'cancelled':
+        return False, 0
     result = False
     price = tick.ask if order.action == 'buy' else tick.bid
     order.status = 'submitted'
@@ -302,9 +297,8 @@ def check_order(order, tick):
 
 
 def fill_order(order, contract, price, milliseconds, oca_relations):
-    """Fill the specified order and return an Execution and an order ID >= 0 if
-    there is another OCA order that should be cancelled. Otherwise, return the
-    execution and -1.
+    """Fill the specified order and return an order ID >= 0 if there is another
+    OCA order that should be cancelled. Otherwise, return -1.
 
     Keyword arguments:
     order         -- ibapipy.data.order.Order object to fill
@@ -318,7 +312,7 @@ def fill_order(order, contract, price, milliseconds, oca_relations):
     order.status = 'filled'
     order.avg_fill_price = price
     order.commission = comms.est_comm(contract, price, order.total_quantity)
-    execution = create_execution(order, milliseconds)
+    order.executions.append(create_execution(order, milliseconds))
     # Try to find the other order in the OCA group
     oca_id = -1
     if order.oca_group != '' and order.oca_group in oca_relations:
@@ -328,4 +322,4 @@ def fill_order(order, contract, price, milliseconds, oca_relations):
             oca_id = loss_id
         else:
             oca_id = profit_id
-    return execution, oca_id
+    return oca_id
