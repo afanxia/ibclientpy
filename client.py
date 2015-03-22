@@ -16,6 +16,8 @@ import ibclientpy.config as config
 
 LOG = logging.getLogger(__name__)
 
+MAX_BLOCK_SIZE = config.MAX_BLOCK_SIZE
+
 
 class Client:
     """Simplified interface to an ibapipy.client_socket.ClientSocket.
