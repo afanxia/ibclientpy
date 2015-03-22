@@ -16,7 +16,7 @@ from ibclientpy.client import Client
 
 
 # Enable debug mode for asyncio
-logging.basicConfig(level=logging.DEBUG)
+#logging.basicConfig(level=logging.DEBUG)
 
 # Contract to use for testing
 TEST_CONTRACT = ibc.Contract('cash', 'eur', 'usd', 'idealpro')
