@@ -111,42 +111,36 @@ class ClientTests(unittest.TestCase):
         self.loop.run_until_complete(task)
         self.loop.run_until_complete(client.disconnect())
 
-    def test_get_history(self):
+    def test_get_next_history_block(self):
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         historical_ticks = []
-        result_queue = asyncio.Queue()
         @asyncio.coroutine
         def get_history():
-            yield from client.get_history(result_queue, TEST_CONTRACT,
-                                          '2015-01-15 10:00',
-                                          '2015-01-15 11:00', 'US/Eastern')
             while True:
-                item = yield from result_queue.get()
-                if item is None:
+                blocks_left, ticks = yield from client.get_next_history_block(
+                        TEST_CONTRACT, '2015-01-15 10:00', '2015-01-15 11:00',
+                        'US/Eastern')
+                if ticks is None:
                     break
-                remaining, tick = item
-                historical_ticks.append(tick)
+                historical_ticks.extend(ticks)
         self.loop.run_until_complete(get_history())
         self.loop.run_until_complete(client.disconnect())
         self.assertEqual(3600, len(historical_ticks))
 
-    def test_get_ticks(self):
+    def test_get_next_tick(self):
         client = Client(self.loop)
         self.loop.run_until_complete(client.connect())
         realtime_ticks = []
-        result_queue = asyncio.Queue()
         @asyncio.coroutine
         def get_ticks():
-            tick_count = 0
-            yield from client.get_ticks(result_queue, TEST_CONTRACT)
             while True:
-                tick = yield from result_queue.get()
+                tick = yield from client.get_next_tick(TEST_CONTRACT)
                 if tick is None:
                     break
                 realtime_ticks.append(tick)
                 if len(realtime_ticks) == 3:
-                    yield from client.cancel_ticks()
+                    yield from client.cancel_ticks(TEST_CONTRACT)
         self.loop.run_until_complete(get_ticks())
         self.loop.run_until_complete(client.disconnect())
         self.assertTrue(len(realtime_ticks) >= 3)
@@ -161,9 +155,10 @@ if __name__ == '__main__':
     all_tests.addTest(ClientTests('test_get_account'))
     all_tests.addTest(ClientTests('test_get_contract'))
     all_tests.addTest(ClientTests('test_get_orders'))
-    all_tests.addTest(ClientTests('test_get_history'))
+    all_tests.addTest(ClientTests('test_get_next_history_block'))
+    all_tests.addTest(ClientTests('test_get_next_tick'))
     single_test = unittest.TestSuite()
-    single_test.addTest(ClientTests('test_get_ticks'))
-    #unittest.TextTestRunner(verbosity=2).run(all_tests)
-    unittest.TextTestRunner(verbosity=2).run(single_test)
+    single_test.addTest(ClientTests('test_get_next_history_block'))
+    unittest.TextTestRunner(verbosity=2).run(all_tests)
+    #unittest.TextTestRunner(verbosity=2).run(single_test)
 

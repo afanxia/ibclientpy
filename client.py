@@ -16,8 +16,6 @@ import ibclientpy.config as config
 
 LOG = logging.getLogger(__name__)
 
-MAX_BLOCK_SIZE = config.MAX_BLOCK_SIZE
-
 
 class Client:
     """Simplified interface to an ibapipy.client_socket.ClientSocket.
@@ -42,6 +40,7 @@ class Client:
         self.next_id = -1
         self.id_contracts = {}
         self.order_handler = iboh.OrderHandler(self)
+        self.history_pending = []
 
     # *************************************************************************
     # Connection
@@ -234,61 +233,94 @@ class Client:
     # *************************************************************************
 
     @asyncio.coroutine
-    def get_history(self, results, contract, start, end, timezone):
-        """Populate the specified results queue with tuples of the form
-        (int, tuple) where 'int' is the number of historical ticks remaining in
-        the request and 'tuple' is a tuple of historical ticks being returned
-        as part of the intermediate result.
+    def get_next_history_block(self, contract, start, end, timezone):
+        """Return the next available block of historical ticks for the
+        specified contract and time period. The result will be of the form
+        (int, tuple) where "int" is the number of blocks remaining to be filled
+        and "tuple" is a list of historical ticks in the current block of
+        prices.
 
-        None will be inserted into the queue when the entire request has been
-        filled.
+        If no more historical blocks are available, (0, None) will be
+        returned.
 
         There will be intermittent delays in the generated data as needed to
         prevent IB pacing violations.
 
         Keyword arguments:
-        results    -- asyncio.Queue instance to hold the result tuples
         contract   -- ibapipy.data.contract.Contract object
         start_date -- start date in 'yyyy-mm-dd hh:mm' format
         end_date   -- end date in 'yyyy-mm-dd hh:mm' format
         timezone   -- timezone in 'Country/Region' format
 
         """
-        blocks = ibhd.get_parameters(contract, start, end, timezone)
-        self.adapter.history_remaining = len(blocks) * config.MAX_BLOCK_SIZE
-        for parms in blocks:
-            yield from asyncio.sleep(parms['delay'])
-            req_id = self.next_id
-            self.next_id += 1
-            self.id_contracts[req_id] = parms['contract']
-            yield from self.adapter.req_historical_data(
-                results, req_id, get_basic_contract(parms['contract']),
-                parms['end_date_time'], parms['duration_str'],
-                parms['bar_size_setting'], parms['what_to_show'],
-                parms['use_rth'], parms['format_date'])
-        yield from results.put(None)
-
-    @asyncio.coroutine
-    def get_ticks(self, results, contract):
-        """Populate the specified results queue with realtime ticks. Ticks will
-        be put into the queue until cancel_ticks() is called at which point
-        None will be put in the queue to signify the end of data.
-
-        Keyword arguments:
-        contract -- ibapipy.data.contract.Contract object
-
-        """
+        # Grab from the queue if we have data waiting
+        if self.adapter.history_queue.qsize() > 0:
+            ticks = yield from self.adapter.history_queue.get()
+            return len(self.history_pending), ticks
+        # Build the initial request if needed
+        if len(self.history_pending) == 0:
+            blocks = ibhd.get_parameters(contract, start, end, timezone)
+            self.history_pending.extend(blocks)
+        # Retrieve the history for the next set of parameters
+        parms = self.history_pending.pop(0)
+        yield from asyncio.sleep(parms['delay'])
         req_id = self.next_id
         self.next_id += 1
-        self.id_contracts[req_id] = contract
-        yield from self.adapter.req_mkt_data(results, req_id, contract)
+        self.id_contracts[req_id] = parms['contract']
+        yield from self.adapter.req_historical_data(
+            req_id, get_basic_contract(parms['contract']),
+            parms['end_date_time'], parms['duration_str'],
+            parms['bar_size_setting'], parms['what_to_show'],
+            parms['use_rth'], parms['format_date'])
+        ticks = yield from self.adapter.history_queue.get()
+        # Check if we're done with the overall request
+        if len(self.history_pending) == 0:
+            yield from self.adapter.history_queue.put(None)
+        return len(self.history_pending), ticks
 
     @asyncio.coroutine
-    def cancel_ticks(self):
-        """Stop receiving ticks from the get_ticks() method."""
-        self.adapter.is_receiving_ticks = False
-        yield from self.adapter.realtime_queue.put(None)
-        # Need to call cancel_mkt_data...
+    def cancel_history(self):
+        """Stop receiving ticks from the get_next_history_block() method."""
+        self.history_pending.clear()
+        while self.adapter.history_queue.qsize() > 0:
+            yield from self.adapter.history_queue.get()
+        yield from self.adapter.history_queue.put(None)
+
+    @asyncio.coroutine
+    def get_next_tick(self, contract):
+        """Return the next available realtime tick for the specified contract.
+        If no more ticks are available (e.g. cancel_ticks() has been called),
+        None will be returned.
+
+        Keyword arguments:
+        contract -- ibapipy.data.contract.Contract instance
+
+        """
+        key = '{0}.{1}'.format(contract.symbol, contract.currency)
+        # Get the request ID for the active market data stream
+        if key in self.adapter.market_data_ids:
+            req_id = self.adapter.market_data_ids[key]
+        # Create a new market data request
+        else:
+            req_id = self.next_id
+            self.next_id += 1
+            self.id_contracts[req_id] = contract
+            yield from self.adapter.req_mkt_data(req_id, contract)
+        # Pull from the queue
+        tick = yield from self.adapter.tick_queue[req_id].get()
+        # If the tick is None, we're done so remove the old request ID
+        if tick is None:
+            self.adapter.market_data_ids.pop(key)
+        return tick
+
+    @asyncio.coroutine
+    def cancel_ticks(self, contract):
+        """Stop receiving ticks from the get_next_tick() method."""
+        key = '{0}.{1}'.format(contract.symbol, contract.currency)
+        if key in self.adapter.market_data_ids:
+            req_id = self.adapter.market_data_ids[key]
+            yield from self.adapter.cancel_mkt_data(req_id)
+            yield from self.adapter.tick_queue[req_id].put(None)
 
 
 def get_basic_contract(contract):

@@ -38,13 +38,14 @@ class ClientAdapter(ibcs.ClientSocket):
         self.open_order_end_called = False
         self.open_order_ids = {}
         # Historical ticks
-        self.history_ready = Future()
-        self.history_remaining = 0
+        self.history_pending = []
         self.history_queue = Queue()
         # Realtime ticks
         self.tick = {}
-        self.is_receiving_ticks = False
-        self.realtime_queue = Queue()
+        # Market data (tick) requests {'symbol.currency' : req_id, ...}
+        self.market_data_ids = {}
+        # Incoming tick queue {req_id : Queue(), ...}
+        self.tick_queue = {}
         # Futures
         self.executions_fut = None
         self.orders_fut = None
@@ -53,6 +54,10 @@ class ClientAdapter(ibcs.ClientSocket):
     # *************************************************************************
     # Outgoing Requests
     # *************************************************************************
+
+    @asyncio.coroutine
+    def cancel_mkt_data(self, req_id):
+        yield from ibcs.ClientSocket.cancel_mkt_data(self, req_id)
 
     @asyncio.coroutine
     def req_account_updates(self, acct_code):
@@ -92,15 +97,13 @@ class ClientAdapter(ibcs.ClientSocket):
         yield from ibcs.ClientSocket.req_executions(self, req_id, exec_filter)
 
     @asyncio.coroutine
-    def req_historical_data(self, results, req_id, contract, end_date_time,
+    def req_historical_data(self, req_id, contract, end_date_time,
                             duration_str, bar_size_setting, what_to_show,
                             use_rth, format_date):
-        self.history_ready = Future()
-        self.history_queue = results
+        self.history_pending.clear()
         yield from ibcs.ClientSocket.req_historical_data(
             self, req_id, contract, end_date_time, duration_str,
             bar_size_setting, what_to_show, use_rth, format_date)
-        yield from self.history_ready
 
     @asyncio.coroutine
     def req_ids(self, num_ids):
@@ -115,10 +118,11 @@ class ClientAdapter(ibcs.ClientSocket):
         return self.account_name_fut
 
     @asyncio.coroutine
-    def req_mkt_data(self, results, req_id, contract, generic_ticklist='',
+    def req_mkt_data(self, req_id, contract, generic_ticklist='',
                      snapshot=False):
-        self.is_receiving_ticks = True
-        self.realtime_queue = results
+        key = '{0}.{1}'.format(contract.symbol, contract.currency)
+        self.market_data_ids[key] = req_id
+        self.tick_queue[req_id] = Queue()
         yield from ibcs.ClientSocket.req_mkt_data(self, req_id, contract,
                                                   generic_ticklist, snapshot)
 
@@ -159,8 +163,9 @@ class ClientAdapter(ibcs.ClientSocket):
                         bar_count, wap, has_gaps):
         contract = self.client.id_contracts[req_id]
         # Download is complete
-        if 'finished' in date and is_future_valid(self.history_ready):
-            self.history_ready.set_result(True)
+        if 'finished' in date:
+            yield from self.history_queue.put(tuple(self.history_pending))
+            self.history_pending.clear()
         # Still receiving bars from the request
         else:
             milliseconds = int(date) * 1000
@@ -168,8 +173,7 @@ class ClientAdapter(ibcs.ClientSocket):
             tick.bid = low
             tick.ask = high
             tick.volume = volume * 100
-            self.history_remaining -= 1
-            yield from self.history_queue.put((self.history_remaining, tick))
+            self.history_pending.append(tick)
 
     @asyncio.coroutine
     def managed_accounts(self, account_number):
@@ -230,6 +234,9 @@ class ClientAdapter(ibcs.ClientSocket):
         order.last_fill_price = last_fill_price
         order.client_id = client_id
         order.why_held = why_held
+        # Update any bracketed orders for this order
+        if order.status == 'filled':
+            self.client.order_handler.update_brackets(order)
         # See if we should set a result on the order cancelled future
         fut = self.order_cancel_fut
         if status == 'cancelled' and fut is not None and not fut.done():
@@ -256,7 +263,7 @@ class ClientAdapter(ibcs.ClientSocket):
             tick.ask = price
         # We can get ask prices lower than bid prices; don't return those.
         if tick.bid > 0 and tick.ask > tick.bid:
-            yield from self.realtime_queue.put(copy_tick(tick))
+            yield from self.tick_queue[req_id].put(copy_tick(tick))
 
     @asyncio.coroutine
     def tick_size(self, req_id, tick_type, size):

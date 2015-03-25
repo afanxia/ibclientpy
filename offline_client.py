@@ -23,7 +23,6 @@ class OfflineClient(ibclientpy.client.Client):
     contract      -- contract associated with the offline ticks
     offline_ticks -- queue of ticks used to provide pricing data
     orders        -- dictionary of orders by request ID
-    is_updating   -- True if ticks are being sent; False, otherwise
 
     """
 
@@ -33,13 +32,12 @@ class OfflineClient(ibclientpy.client.Client):
         self.next_id = 1
         self.contract = contract
         self.offline_ticks = asyncio.Queue()
-        self.orders = {}
-        self.is_updating = False
 
     # *************************************************************************
     # Internal Methods
     # *************************************************************************
 
+    @asyncio.coroutine
     def __handle_orders__(self, tick):
         """Process orders based on the specified incoming tick.
 
@@ -47,19 +45,25 @@ class OfflineClient(ibclientpy.client.Client):
         tick -- ibapipy.data.tick.Tick object
 
         """
-        need_filled, need_cancelled, need_updated = [], [], []
         # Check for orders to fill
-        for order_id in self.orders:
-            order = self.orders[order_id]
+        need_filled = []
+        for order_id in self.order_handler.orders:
+            order = self.order_handler.orders[order_id]
             can_fill, price = check_order(order, tick)
             if can_fill:
                 need_filled.append((order, price))
         # Fill orders
         for order, price in need_filled:
             cancel_id = fill_order(order, self.contract, price,
-                                   tick.milliseconds, self.oca_relations)
-            if cancel_id >= 0 and cancel_id in self.orders:
-                self.orders[cancel_id].status = 'cancelled'
+                                   tick.milliseconds,
+                                   self.order_handler.child_orders)
+            if cancel_id >= 0 and cancel_id in self.order_handler.orders:
+                self.order_handler.orders[cancel_id].status = 'cancelled'
+            # Update the status
+            yield from self.adapter.order_status(
+                order.order_id, order.status, order.filled, order.remaining,
+                order.avg_fill_price, order.perm_id, order.parent_id,
+                order.avg_fill_price, order.client_id, order.why_held)
 
     # *************************************************************************
     # Connection
@@ -140,7 +144,7 @@ class OfflineClient(ibclientpy.client.Client):
         associated with the order.
 
         """
-        return tuple(self.orders.values())
+        return tuple(self.order_handler.orders.values())
 
     @asyncio.coroutine
     def place_order(self, contract, order, profit_offset=0, loss_offset=0):
@@ -156,14 +160,14 @@ class OfflineClient(ibclientpy.client.Client):
 
         Keyword arguments:
         contract      -- ibapipy.data.contract.Contract object
-        parent        -- ibapipy.data.order.Order object
+        order         -- ibapipy.data.order.Order object
         profit_offset -- profit target offset from parent's fill price
                          (default: 0)
         loss_offset   -- loss target offset from parent's fill price
                          (default: 0)
 
         """
-        if order.order_id in self.orders:
+        if order.order_id in self.order_handler.orders:
             req_id = order.order_id
         else:
             req_id = self.next_id
@@ -171,10 +175,12 @@ class OfflineClient(ibclientpy.client.Client):
             self.id_contracts[req_id] = contract
             order.order_id = req_id
             order.perm_id = req_id
-        self.bracket_parms[req_id] = (profit_offset, loss_offset)
+            order.status = 'presubmitted'
         order.contract = contract
         order.executions = []
-        self.orders[req_id] = order
+        self.order_handler.add_order(order, profit_offset, loss_offset)
+        self.order_handler.orders[req_id] = order
+        yield from self.adapter.open_order(req_id, contract, order)
         return req_id
 
     @asyncio.coroutine
@@ -185,8 +191,8 @@ class OfflineClient(ibclientpy.client.Client):
         req_id -- request ID
 
         """
-        if req_id in self.orders:
-            order = self.orders[req_id]
+        if req_id in self.order_handler.orders:
+            order = self.order_handler.orders[req_id]
             order.status = 'cancelled'
 
     # *************************************************************************
@@ -194,11 +200,15 @@ class OfflineClient(ibclientpy.client.Client):
     # *************************************************************************
 
     @asyncio.coroutine
-    def get_history(self, contract, start, end, timezone):
-        """Return a generator containing tuples of the form (int, list) where
-        'int' is the number of historical ticks remaining the the request and
-        'list' is a list of historical ticks being returned as part of the
-        intermediate result.
+    def get_next_history_block(self, contract, start, end, timezone):
+        """Return the next available block of historical ticks for the
+        specified contract and time period. The result will be of the form
+        (int, tuple) where "int" is the number of blocks remaining to be filled
+        and "tuple" is a list of historical ticks in the current block of
+        prices.
+
+        If no more historical blocks are available, (0, None) will be
+        returned.
 
         There will be intermittent delays in the generated data as needed to
         prevent IB pacing violations.
@@ -213,29 +223,49 @@ class OfflineClient(ibclientpy.client.Client):
         pass
 
     @asyncio.coroutine
-    def get_ticks(self, results, contract):
-        """Populate the specified results queue with realtime ticks. Ticks will
-        be put into the queue until cancel_ticks() is called at which point
-        None will be put in the queue to signify the end of data.
+    def cancel_history(self):
+        """Stop receiving ticks from the get_next_history_block() method."""
+        pass
+
+    @asyncio.coroutine
+    def get_next_tick(self, contract):
+        """Return the next available realtime tick for the specified contract.
+        If no more ticks are available (e.g. cancel_ticks() has been called),
+        None will be returned.
 
         Keyword arguments:
-        contract -- ibapipy.data.contract.Contract object
+        contract -- ibapipy.data.contract.Contract instance
 
         """
-        req_id = self.next_id
-        self.next_id += 1
-        self.id_contracts[req_id] = contract
-        self.is_updating = True
-        while self.is_updating and not self.offline_ticks.empty():
+        if self.offline_ticks.qsize() == 0:
+            return None
+        key = '{0}.{1}'.format(contract.symbol, contract.currency)
+        # Get the request ID for the active market data stream
+        if key in self.adapter.market_data_ids:
+            req_id = self.adapter.market_data_ids[key]
+        # Create a new market data request
+        else:
+            req_id = self.next_id
+            self.next_id += 1
+            self.id_contracts[req_id] = contract
+        # Pull from the queue
+        if self.offline_ticks.qsize() > 0:
             tick = yield from self.offline_ticks.get()
-            yield from results.put(tick)
-        yield from results.put(None)
-        self.is_updating = False
+        else:
+            tick = None
+        # If the tick is None, we're done so remove the old request ID
+        if tick is None and key in self.adapter.market_data_ids:
+            self.adapter.market_data_ids.pop(key)
+        # ... otherwise process orders
+        else:
+            yield from self.__handle_orders__(tick)
+        return tick
 
     @asyncio.coroutine
     def cancel_ticks(self):
-        """Stop receiving ticks from the get_ticks() method."""
-        self.is_updating = False
+        """Stop receiving ticks from the get_next_tick() method."""
+        while self.offline_ticks.qsize() > 0:
+            yield from self.offline_ticks.get()
 
 
 def create_execution(order, milliseconds):
