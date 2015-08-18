@@ -1,4 +1,4 @@
-"""Settings and options for the ibclient package."""
+"""Settings and options for the ibclientpy package."""
 
 
 # *****************************************************************************
