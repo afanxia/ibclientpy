@@ -3,7 +3,6 @@ the ibclientpy.client.Client class. Calls to the broker are replaced with
 locally handled simulated results.
 
 """
-from asyncio import Future
 import asyncio
 import logging
 import ibapipy.data.execution as ibe
