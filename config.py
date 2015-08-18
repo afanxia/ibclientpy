@@ -31,7 +31,7 @@ BAR_SIZE = '{0:d} secs'.format(BAR_SIZE_SECONDS)
 # BID      -- open/high same, low/close same, no volume or count
 # ASK      -- open/high same, low/close same, no volume or count
 # BID_ASK  -- open is the bid, close is the ask, no volume or count
-WHAT_TO_SHOW = {'STK': 'TRADES', 'CASH': 'BID_ASK'}
+WHAT_TO_SHOW = {'STK': 'BID_ASK', 'CASH': 'BID_ASK'}
 
 # Only use regular trading hours (if True)
 USE_RTH = False
