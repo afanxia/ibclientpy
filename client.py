@@ -5,7 +5,6 @@
 from asyncio import Future
 import asyncio
 import logging
-import time
 import ibapipy.data.contract as ibc
 import ibapipy.data.execution_filter as ibef
 import ibclientpy.client_adapter as ibca
@@ -104,9 +103,19 @@ class Client:
 
         """
         account_name = yield from self.get_account_name()
-        future = yield from self.adapter.req_account_updates(account_name)
-        yield from future
-        return future.result()
+        accounts_list = [x.strip() for x in account_name.split(',')]
+        if len(accounts_list) > 1:
+            futureresults = []
+            for account in accounts_list:
+                if account is not "" and account.startswith('f'):
+                    future = yield from self.adapter.req_account_updates(account)
+                    yield from future
+                    futureresults.append(future.result())
+            return futureresults
+        else:
+            future = yield from self.adapter.req_account_updates(account_name)
+            yield from future
+            return future.result()
 
     # *************************************************************************
     # Contracts
