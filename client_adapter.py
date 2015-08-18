@@ -5,11 +5,8 @@ ibclientpy.client.Client.
 from asyncio import Future, Queue
 from ibapipy.data.account import Account
 from ibapipy.data.holding import Holding
-from ibapipy.data.order import Order
 from ibapipy.data.tick import Tick
 import asyncio
-import calendar
-import pytz
 import time
 import ibapipy.client_socket as ibcs
 import ibclientpy.date_support as ds
@@ -294,10 +291,10 @@ class ClientAdapter(ibcs.ClientSocket):
         timestamp -- last update time for account data
 
         """
-        partial_date = ms_to_str(time.time() * 1000, 'UTC', '%Y-%m-%d')
+        partial_date = ds.ms_to_str(time.time() * 1000, 'UTC', '%Y-%m-%d')
         full_date = '{0} {1}'.format(partial_date, timestamp)
-        self.account.milliseconds = str_to_ms(full_date, 'UTC',
-                                                      '%Y-%m-%d %H:%M')
+        self.account.milliseconds = ds.str_to_ms(full_date, 'UTC',
+                                                 '%Y-%m-%d %H:%M')
 
     @asyncio.coroutine
     def update_account_value(self, key, value, currency, account_name):
@@ -394,49 +391,3 @@ def is_future_valid(future):
     """
     return future is not None and not future.done()
 
-
-def ms_to_str(milliseconds, timezone='UTC', formatting='%Y-%m-%d %H:%M:%S.%f'):
-    """Converts the specified time in milliseconds to a string.
-
-    Please see the following for formatting directives:
-    http://docs.python.org/library/datetime.html#strftime-strptime-behavior
-
-    Keyword arguments:
-    milliseconds -- time in milliseconds since the Epoch
-    timezone     -- timezone string (default: 'UTC')
-    formatting   -- formatting string (default: '%Y-%m-%d %H:%M:%S.%f')
-
-    """
-    seconds = int(milliseconds / 1000)
-    microseconds = (milliseconds % 1000) * 1000
-    gmtime = time.gmtime(seconds)
-    dtime = pytz.datetime.datetime(gmtime.tm_year, gmtime.tm_mon,
-                                   gmtime.tm_mday, gmtime.tm_hour,
-                                   gmtime.tm_min, gmtime.tm_sec, microseconds,
-                                   pytz.timezone('UTC'))
-    dtime = dtime.astimezone(pytz.timezone(timezone))
-    return dtime.strftime(formatting)
-
-
-def str_to_ms(date, timezone='UTC', formatting='%Y-%m-%d %H:%M:%S.%f'):
-    """Converts the specified string to milliseconds since the Epoch.
-
-    Keyword arguments:
-    date       -- date string
-    timezone   -- timezone string (default: 'UTC')
-    formatting -- formatting string (default: '%Y-%m-%d %H:%M:%S.%f')
-
-    """
-    dtime = pytz.datetime.datetime.strptime(date, formatting)
-    # Note that in order for daylight savings conversions to work, we
-    # MUST use localize() here and cannot simply pass a timezone into the
-    # datetime constructor. This is because derple, werpy, durp, durp ...
-    tzone = pytz.timezone(timezone)
-    dtime = pytz.datetime.datetime(dtime.year, dtime.month, dtime.day,
-                                   dtime.hour, dtime.minute, dtime.second,
-                                   dtime.microsecond)
-    dtime = tzone.localize(dtime)
-    dtime = dtime.astimezone(pytz.timezone('UTC'))
-    milliseconds = calendar.timegm(dtime.utctimetuple()) * 1000
-    milliseconds = int(milliseconds + dtime.microsecond / 1000.0)
-    return milliseconds
