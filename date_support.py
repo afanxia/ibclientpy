@@ -36,7 +36,7 @@ def ms_to_str(milliseconds, timezone='UTC', formatting='%Y-%m-%d %H:%M:%S.%f'):
 
     """
     seconds = int(milliseconds / 1000)
-    microseconds = (milliseconds % 1000) * 1000
+    microseconds = int((milliseconds % 1000) * 1000)
     gmtime = time.gmtime(seconds)
     dtime = pytz.datetime.datetime(gmtime.tm_year, gmtime.tm_mon,
                                    gmtime.tm_mday, gmtime.tm_hour,
